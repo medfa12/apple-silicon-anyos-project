@@ -1,0 +1,61 @@
+diff --git a/hw/display/Makefile.objs b/hw/display/Makefile.objs
+index d619594a..43aee18d 100644
+--- a/hw/display/Makefile.objs
++++ b/hw/display/Makefile.objs
+@@ -3,6 +3,7 @@ common-obj-$(CONFIG_EDID) += edid-generate.o edid-region.o
+ 
+ common-obj-$(CONFIG_FW_CFG_DMA) += ramfb.o
+ common-obj-$(CONFIG_FW_CFG_DMA) += ramfb-standalone.o
++common-obj-y += xnu_ramfb.o
+ 
+ common-obj-$(CONFIG_ADS7846) += ads7846.o
+ common-obj-$(CONFIG_VGA_CIRRUS) += cirrus_vga.o
+diff --git a/hw/display/xnu_ramfb.c b/hw/display/xnu_ramfb.c
+index b20609f8..65859463 100644
+--- a/hw/display/xnu_ramfb.c
++++ b/hw/display/xnu_ramfb.c
+@@ -60,7 +60,7 @@ void xnu_display_prolog(xnu_ramfb_state* xnu_fb_state)
+ void xnu_ramfb_setup(xnu_ramfb_state* xnu_fb_state)
+ {
+     uint8_t* fb_ptr;
+-    xnu_fb_state->display_cfg.format = PIXMAN_LE_r8g8b8;
++    xnu_fb_state->display_cfg.format = PIXMAN_LE_x8r8g8b8;
+ 
+     if (xnu_fb_state->fb_size == 0){
+         fprintf(stderr,
+@@ -94,7 +94,7 @@ static void xnu_ramfb_realizefn(DeviceState *dev, Error **errp)
+     xnu_ramfb_setup(xnu_ramfb);
+ }
+ 
+-static void xnu_ramfb_unrealizefn(DeviceState *dev, Error **errp)
++static void xnu_ramfb_unrealizefn(DeviceState *dev)
+ {
+     xnu_ramfb_state *xnu_ramfb = XNU_RAMFB(dev);
+     graphic_console_close(xnu_ramfb->con);
+@@ -121,7 +121,7 @@ static void xnu_ramfb_class_initfn(ObjectClass *klass, void *data)
+     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+     dc->realize = xnu_ramfb_realizefn;
+     dc->unrealize = xnu_ramfb_unrealizefn;
+-    dc->props = xnu_ramfb_properties;
++    device_class_set_props(dc, xnu_ramfb_properties);
+     dc->desc = "xnu ram framebuffer";
+     dc->user_creatable = true;
+ }
+diff --git a/include/hw/arm/xnu_fb_cfg.h b/include/hw/arm/xnu_fb_cfg.h
+index 0adb763a..0b453ea8 100644
+--- a/include/hw/arm/xnu_fb_cfg.h
++++ b/include/hw/arm/xnu_fb_cfg.h
+@@ -5,11 +5,11 @@
+ 
+ #define RAMFB_SIZE 0x2D4C00
+ 
+-#define V_DEPTH     16
++#define V_DEPTH     32
+ #define V_HEIGHT    800
+ #define V_WIDTH     600
+ #define V_DISPLAY   0
+-#define V_LINESIZE  (V_WIDTH * 3)
++#define V_LINESIZE  (V_WIDTH * 4)
+ 
+ void xnu_define_ramfb_device(AddressSpace* as, hwaddr ramfb_pa);
+ void xnu_get_video_bootargs(void *opaque, hwaddr ramfb_pa);

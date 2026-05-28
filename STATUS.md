@@ -10,10 +10,14 @@
 - **Made reproducible on a modern Apple-Silicon host:** serial output restored
   (kprintf enable-flag repoint + UART tap) and JIT throughput improved ~2.8×
   via a thread-local W^X nesting refcount. See `patches/tcg/`.
+- **Interactive shell over serial.** With a real TTY on stdin the shell runs
+  typed commands and returns output (`ls /` lists the XNU root; `uname`/`id` are
+  absent — the SU recovery ramdisk is a stripped userland).
+- **Graphical kernel console.** With `xnu-ramfb=on` the kernel software-renders
+  its verbose boot console — through to the `bash-3.2#` prompt — into a
+  framebuffer viewable over VNC. See `patches/graphics/`.
 
 ## Known limitations
-- The reached prompt was captured non-interactively; driving the shell needs a
-  real TTY on stdin.
 - On a macOS host, runtime TB chaining is broken under Apple W^X (pre-existing),
   so runs require `-d nochain`. A Linux host avoids this entirely (the W^X layer
   is Apple-guarded and compiles out).
@@ -22,7 +26,7 @@
 
 ## Next
 The clean foundation is the **Linux ARM port** (no W^X penalty, working
-chaining, fast boot), followed by the tiered graphical path. Both — including an
-honest analysis of what is and isn't reachable (a graphical kernel *console* is
-feasible; a full Aqua/WindowServer desktop is not, on the cross-platform path) —
-are laid out in [`docs/ROADMAP_crossplatform_gui.md`](docs/ROADMAP_crossplatform_gui.md).
+chaining, fast boot). The graphical kernel console (Tier 1) is now reached; a
+full Aqua/WindowServer desktop remains out of scope on the cross-platform path.
+The honest display-tier analysis is in
+[`docs/ROADMAP_crossplatform_gui.md`](docs/ROADMAP_crossplatform_gui.md).

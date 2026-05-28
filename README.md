@@ -23,7 +23,7 @@ QEMU 5.1.0 did not originally work — taking it under **QEMU 5.1.0 + TCG**
 through `launchd` (PID 1) to a `bash-3.2#` userland prompt (reached and captured
 non-interactively).
 
-The two original contributions:
+The original contributions:
 
 1. **Serial visibility fix** — the early `kprintf` enable flags were being
    written to the wrong control words; repointing them (verified by
@@ -38,11 +38,21 @@ The two original contributions:
    codegen round, and incidentally fixes a latent SIGBUS on the runtime
    block-chaining path. Strict superset of the prior trace: every previously
    reached PC still reached, zero regressions.
+3. **Graphical console** — the fork shipped an `xnu_ramfb` framebuffer device
+   that was dead code (the upstream demo always ran `xnu-ramfb=off`, so it had
+   never been compiled). Wiring it into the build, fixing its QEMU-5.1 API
+   drift, and reconciling the pixel depth (16→32bpp) makes the kernel
+   software-render its verbose boot console — through to the `bash-3.2#` prompt
+   — into a framebuffer viewable over VNC. This is a graphical kernel *console*,
+   not an Aqua desktop (see the roadmap for why a desktop is out of scope here).
 
-| Path | Host | Status |
+| Capability | Host | Status |
 |---|---|---|
-| TCG (software emulation) | Any (Linux / Windows / macOS ARM, x86 fallback) | **Reaches userland `bash` on the J273 baseline** |
-| Cross-platform port | Linux / Windows ARM | Planned — see `docs/ROADMAP_crossplatform_gui.md` |
+| Boot to userland `bash` (serial) | Any (Linux / Windows / macOS ARM, x86 fallback) | **Reached** on the J273 baseline |
+| Interactive shell over serial | Any | **Reached** (commands run, output returned) |
+| Graphical kernel console (framebuffer/VNC) | Any | **Reached** — `patches/graphics/` |
+| Full Aqua/WindowServer desktop | — | Out of scope (needs Apple GPU stack) |
+| Fast cross-platform port | Linux / Windows ARM | Planned — see `docs/ROADMAP_crossplatform_gui.md` |
 
 ## Layout
 
@@ -56,8 +66,11 @@ docs/
                                with an honest infeasibility analysis for a full
                                graphical desktop.
 patches/tcg/
-  0001-wx-batching-and-serial-visibility.patch   The two fixes above (reference diff).
+  0001-wx-batching-and-serial-visibility.patch   The serial + W^X fixes (reference diff).
   README.md                                       How to rebuild and reproduce.
+patches/graphics/
+  0001-ramfb-graphical-console.patch              Activates xnu-ramfb -> kernel console on a framebuffer.
+  README.md                                       The three ramfb fixes + how to view over VNC.
 ```
 
 ## Reproducing
