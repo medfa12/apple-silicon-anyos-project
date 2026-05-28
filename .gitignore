@@ -1,0 +1,24 @@
+# Apple-supplied artifacts — never commit (you must supply your own)
+*.dmg
+*.dmg.out
+*.im4p
+*.im4p.out
+kernelcache*
+*ramdisk*
+DeviceTree*
+*.bin
+
+# Build output / binaries
+*.o
+*.out
+*.exe
+build/
+aarch64-softmmu/
+
+# Logs and scratch
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+*.swp
