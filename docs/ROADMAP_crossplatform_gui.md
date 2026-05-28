@@ -44,7 +44,13 @@ macOS 12 guests — it abandons the cross-platform goal and is absent from this 
  bash/zsh not to freeze on JOP/PAC (INSIGHTS sec 6).
 - **Go/No-Go:** Interactive bash reproduced on macOS host → proceed to B. (Gating dependency.)
 
-### Phase B — Port to Linux ARM host → fast serial bash
+### Phase B — Port to Linux ARM host → fast serial bash  ✅ DONE
+- **Result (proven):** On a Debian 12 ARM64 (Ampere) cloud instance the same source tree builds
+  cleanly (Python 3.11, `--disable-werror`, bundled submodules) with **no** W^X retrofit, **no**
+  codesigning, and **no** `-d nochain` — runtime TB chaining works because the Apple-guarded W^X
+  layer compiles out. Boot to `bash-3.2#` in **~50 s** (≈4× faster than the macOS host), and the
+  interactive shell works. This confirms the cross-platform thesis end to end. The build/run
+  scripts in the kit automate it.
 - **Goal:** Build and run the *same* fork on a Linux aarch64 host, reaching interactive serial
  bash with **no** W^X overhead (the retrofit sites are all
  `#if defined(__APPLE__) && defined(__aarch64__)` and compile out).

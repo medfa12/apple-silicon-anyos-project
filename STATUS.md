@@ -16,6 +16,12 @@
 - **Graphical kernel console.** With `xnu-ramfb=on` the kernel software-renders
   its verbose boot console — through to the `bash-3.2#` prompt — into a
   framebuffer viewable over VNC. See `patches/graphics/`.
+- **Cross-platform port PROVEN on Linux/ARM.** The same source tree builds
+  cleanly on a Debian 12 ARM64 (Ampere) cloud instance — no W^X retrofit, no
+  codesigning, no `-d nochain` — and boots to `bash-3.2#` in **~50 s** with TB
+  chaining enabled (≈4× faster than the macOS host, matching the original
+  Linux/TCG figure). Interactive shell confirmed there too. See
+  `docs/ROADMAP_crossplatform_gui.md` Phase B and the build/run scripts.
 
 ## Known limitations
 - On a macOS host, runtime TB chaining is broken under Apple W^X (pre-existing),
