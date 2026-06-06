@@ -1,0 +1,255 @@
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 5655db13..73b274ce 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -1698,6 +1698,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+     target_ulong virt_page2;
+     tcg_insn_unit *gen_code_buf;
+     int gen_code_size, search_size, max_insns;
++#if defined(__APPLE__) && defined(__aarch64__)
++    /* guarantee the W^X writable window is opened exactly once
++     * and always closed, even across the buffer_overflow retry. */
++    bool wx_open = false;
++#endif
+ #ifdef CONFIG_PROFILER
+     TCGProfile *prof = &tcg_ctx->prof;
+     int64_t ti;
+@@ -1730,6 +1735,17 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+  buffer_overflow:
+     tb = tcg_tb_alloc(tcg_ctx);
+     if (unlikely(!tb)) {
++#if defined(__APPLE__) && defined(__aarch64__)
++        /* cpu_loop_exit() does siglongjmp out of this function.
++         * If we reached here via a buffer_overflow retry the writable window
++         * may already be open; close it first so the thread is left in X mode
++         * and the refcount does not leak (a stranded W window SIGBUSes on the
++         * next JIT execution). */
++        if (wx_open) {
++            jit_write_protect_enable();
++            wx_open = false;
++        }
++#endif
+         /* flush must be done */
+         tb_flush(cpu);
+         mmap_unlock();
+@@ -1741,9 +1757,17 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+ #if defined(__APPLE__) && defined(__aarch64__)
+     /* The TB metadata (this struct) and the machine code emitted into
+      * tb->tc.ptr live inside the MAP_JIT region. Flip the calling thread
+-     * to writable mode for the whole duration of this function. */
+-    if (__builtin_available(macOS 11.0, *)) {
+-        pthread_jit_write_protect_np(0);
++     * to writable mode for the whole duration of this function.
++     *
++     * route through the refcounted API and open the window
++     * exactly once. The buffer_overflow retry re-enters here after
++     * tcg_tb_alloc; wx_open prevents a redundant disable()/extra APRR trap
++     * and prevents a refcount leak. Note the alloc-failure path above
++     * (tcg_tb_alloc==NULL -> cpu_loop_exit) runs BEFORE this, so wx_open is
++     * still false there and no enable() is needed. */
++    if (!wx_open) {
++        jit_write_protect_disable();
++        wx_open = true;
+     }
+ #endif
+ 
+@@ -1935,18 +1959,24 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+         atomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+         tb_destroy(tb);
+ #if defined(__APPLE__) && defined(__aarch64__)
+-        if (__builtin_available(macOS 11.0, *)) {
+-            pthread_jit_write_protect_np(1);
+-            sys_icache_invalidate(gen_code_buf, gen_code_size > 0 ? gen_code_size : 1);
++        /* invalidate the emitted range (we did write code), then
++         * close the single writable window via the refcount (restores X). */
++        sys_icache_invalidate(gen_code_buf, gen_code_size > 0 ? gen_code_size : 1);
++        if (wx_open) {
++            jit_write_protect_enable();
++            wx_open = false;
+         }
+ #endif
+         return existing_tb;
+     }
+     tcg_tb_insert(tb);
+ #if defined(__APPLE__) && defined(__aarch64__)
+-    if (__builtin_available(macOS 11.0, *)) {
+-        pthread_jit_write_protect_np(1);
+-        sys_icache_invalidate(gen_code_buf, gen_code_size > 0 ? gen_code_size : 1);
++    /* invalidate the emitted range, then close the single
++     * writable window via the refcount (restores X mode for execution). */
++    sys_icache_invalidate(gen_code_buf, gen_code_size > 0 ? gen_code_size : 1);
++    if (wx_open) {
++        jit_write_protect_enable();
++        wx_open = false;
+     }
+ #endif
+     return tb;
+diff --git a/hw/arm/j273_macos11.c b/hw/arm/j273_macos11.c
+index f44ef719..970a643a 100644
+--- a/hw/arm/j273_macos11.c
++++ b/hw/arm/j273_macos11.c
+@@ -327,16 +327,14 @@ struct darwin_kernel_patch darwin_patches_20C69 = {
+         DARWIN_PATCH(0xfffffe000806b438, g_w10_zero_inst), // parse_machfile slide set instruction
+         DARWIN_PATCH(0xfffffe0008cb6538, g_mov_w0_01_inst), // core trust check
+         DARWIN_PATCH(0xfffffe000806b234, g_nop_inst), // load_machfile: disable IMGPF_NOJOP
+-        // an earlier experiment: tried forcing kprintf's u32 flags
+-        // at PA-equivalent of VA 0xfffffe000a430c8c / 0xa430cd8 to
+-        // all-ones to skip the cbz at 0x8265d14 and reach serial_putc
+-        // directly. Did NOT produce serial output by itself --
+-        // serial_putc internally CBZs on a function pointer
+-        // (PE_serial_putc) loaded from 0xa430950 which is still NULL
+-        // until PE_init_kprintf runs. Patches retained in case
+-        // they help once the function pointer is wired up.
+-        DARWIN_PATCH(0xfffffe000a430c8c, g_kprintf_enable), // kprintf enable flag A
+-        DARWIN_PATCH(0xfffffe000a430cd8, g_kprintf_enable), // kprintf enable flag B
++        // repointed kprintf enable flags to the CORRECT words.
++        // Disassembly of _kprintf @0xfffffe0008265cd0 shows it loads two
++        // u32s via `adrp x8,0xa430000; ldr w8,[x8,#0x8c8]` and
++        // `ldr w9,[x9,#0x8d8]`, ORs them, then `cbz w8`. So the gate words
++        // are at VA 0xa4308c8 and 0xa4308d8 -- NOT the previous (incorrect) addresses
++        // 0xa430c8c/0xa430cd8 (which hit unrelated words and had no effect).
++        DARWIN_PATCH(0xfffffe000a4308c8, g_kprintf_enable), // kprintf enable flag A
++        DARWIN_PATCH(0xfffffe000a4308d8, g_kprintf_enable), // kprintf enable flag B
+     }
+ };
+ 
+diff --git a/hw/char/exynos4210_uart.c b/hw/char/exynos4210_uart.c
+index 9c8ab3a7..0f59a53f 100644
+--- a/hw/char/exynos4210_uart.c
++++ b/hw/char/exynos4210_uart.c
+@@ -427,6 +427,11 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
+         break;
+ 
+     case UTXH:
++        /* belt-and-suspenders serial tap. Mirror every guest
++         * UART TX byte to stderr unconditionally so it is captured in the
++         * boot log regardless of the chardev mux/backend state. Harmless. */
++        fputc((int)(uint8_t)val, stderr);
++        fflush(stderr);
+         if (qemu_chr_fe_backend_connected(&s->chr)) {
+             s->reg[I_(UTRSTAT)] &= ~(UTRSTAT_TRANSMITTER_EMPTY |
+                     UTRSTAT_Tx_BUFFER_EMPTY);
+diff --git a/tcg/aarch64/tcg-target.h b/tcg/aarch64/tcg-target.h
+index eb474893..280b2a8e 100644
+--- a/tcg/aarch64/tcg-target.h
++++ b/tcg/aarch64/tcg-target.h
+@@ -152,22 +152,56 @@ typedef enum {
+ #if defined(__APPLE__)
+ #include <libkern/OSCacheControl.h>
+ #include <pthread.h>
+-/* Apple Silicon W^X protocol. tb_gen_code holds write-protect OFF for
+- * the entire duration of TB construction (the TranslationBlock metadata
+- * and the emitted machine code share a MAP_JIT region). flush_icache_range
+- * just issues the cache flush — the X/W flip is handled by tb_gen_code. */
+-static inline void tcg_apple_jit_writable_begin(void)
++/* Apple Silicon W^X protocol (an earlier iteration refcount rework).
++ *
++ * The TranslationBlock metadata AND the emitted machine code share a single
++ * MAP_JIT region, so even metadata writes need the calling thread in W mode.
++ * Previously every nested codegen helper issued its own
++ * pthread_jit_write_protect_np(0)/(1) pair -> an APRR kernel trap each, which
++ * dominated translation throughput (~120 TB/s).
++ *
++ * We replace the raw toggles with a thread-local NESTING REFCOUNT
++ * (qemu_jit_wx_depth). disable() only issues a real APRR trap on the 0->1
++ * transition; enable() only on the 1->0 transition. APRR state is per-thread,
++ * so a __thread counter is MTTCG-safe. The storage is defined once in
++ * tcg-target.inc.c.  Invariant: depth==0  <=>  thread is in X (execute) mode.
++ */
++extern __thread int qemu_jit_wx_depth;
++
++static inline void jit_write_protect_disable(void)
++{
++    if (__builtin_available(macOS 11.0, *)) {
++        if (qemu_jit_wx_depth++ == 0) {
++            pthread_jit_write_protect_np(0);   /* W on */
++        }
++    }
++}
++static inline void jit_write_protect_enable(void)
+ {
+     if (__builtin_available(macOS 11.0, *)) {
+-        pthread_jit_write_protect_np(0);
++        if (--qemu_jit_wx_depth == 0) {
++            pthread_jit_write_protect_np(1);   /* X on */
++        }
+     }
+ }
++/* Balanced writable window helpers (route through the refcount). */
++static inline void tcg_apple_jit_writable_begin(void)
++{
++    jit_write_protect_disable();
++}
++static inline void tcg_apple_jit_writable_end(void)
++{
++    jit_write_protect_enable();
++}
+ static inline void flush_icache_range(uintptr_t start, uintptr_t stop)
+ {
+     sys_icache_invalidate((void *)start, stop - start);
+ }
+ #else
++static inline void jit_write_protect_disable(void) {}
++static inline void jit_write_protect_enable(void) {}
+ static inline void tcg_apple_jit_writable_begin(void) {}
++static inline void tcg_apple_jit_writable_end(void) {}
+ static inline void flush_icache_range(uintptr_t start, uintptr_t stop)
+ {
+     __builtin___clear_cache((char *)start, (char *)stop);
+diff --git a/tcg/aarch64/tcg-target.inc.c b/tcg/aarch64/tcg-target.inc.c
+index 799a891d..2b195e4e 100644
+--- a/tcg/aarch64/tcg-target.inc.c
++++ b/tcg/aarch64/tcg-target.inc.c
+@@ -13,6 +13,13 @@
+ #include "../tcg-pool.inc.c"
+ #include "qemu/bitops.h"
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
++/* single definition of the thread-local W^X nesting refcount.
++ * Declared `extern __thread int qemu_jit_wx_depth;` in tcg-target.h and used
++ * by jit_write_protect_disable()/enable(). depth==0 <=> thread in X mode. */
++__thread int qemu_jit_wx_depth = 0;
++#endif
++
+ /* We're going to re-use TCGType in setting of the SF bit, which controls
+    the size of the operation performed.  If we know the values match, it
+    makes things much cleaner.  */
+@@ -1368,6 +1375,11 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
+     tcg_apple_jit_writable_begin();
+     atomic_set((uint64_t *)jmp_addr, pair);
+     flush_icache_range(jmp_addr, jmp_addr + 8);
++    /* balance the writable window. When called from inside
++     * tb_gen_code the refcount stays >0 (no extra trap); when called from the
++     * runtime tb_add_jump chaining path this restores X mode before JIT code
++     * executes again, fixing a latent SIGBUS where the thread was left in W. */
++    tcg_apple_jit_writable_end();
+ }
+ 
+ static inline void tcg_out_goto_label(TCGContext *s, TCGLabel *l)
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index 2d881a97..50abdba9 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -1069,6 +1069,10 @@ void tcg_prologue_init(TCGContext *s)
+ #endif
+ 
+     /* Generate the prologue.  */
++    /* tcg_apple_jit_writable_begin() now routes through the
++     * refcount (depth 0->1, one APRR trap). Balanced by
++     * tcg_apple_jit_writable_end() below instead of a raw write_protect(1),
++     * so the counter is never bypassed. */
+     tcg_apple_jit_writable_begin();
+     tcg_target_qemu_prologue(s);
+ 
+@@ -1082,9 +1086,8 @@ void tcg_prologue_init(TCGContext *s)
+ 
+     buf1 = s->code_ptr;
+ #if defined(__APPLE__) && defined(__aarch64__)
+-    if (__builtin_available(macOS 11.0, *)) {
+-        pthread_jit_write_protect_np(1);
+-    }
++    /* balance the writable window opened above via the refcount. */
++    tcg_apple_jit_writable_end();
+ #endif
+     flush_icache_range((uintptr_t)buf0, (uintptr_t)buf1);
+ 
