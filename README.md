@@ -40,13 +40,25 @@ machine:
    verbose boot console — through to the `bash-3.2#` prompt — into a framebuffer
    viewable over VNC. A graphical kernel *console*, not an Aqua desktop.
 
-4. **Framework-free Apple paravirtual-graphics + Metal→Vulkan path** *(modern
-   `vmapple` track)*. A from-scratch reimplementation of the Apple PVG device
-   that runs **without** Apple's `ParavirtualizedGraphics.framework`, plus a
-   Metal-command-stream → Vulkan (lavapipe) translation path — so the guest GPU
-   stack can run on a GPU-less, non-Apple host. ~6k lines across 9 new files
-   (the native PVG backend, the MMIO glue, the op-stream tap, the SPIR-V present
-   pipeline, and an offline replay harness).
+4. **Framework-free Apple paravirtual-graphics + a Metal→Vulkan translator that
+   renders a real composite frame on a GPU-less non-Apple host** *(modern
+   `vmapple` track)*. A from-scratch reimplementation of the Apple PVG device that
+   runs **without** Apple's `ParavirtualizedGraphics.framework`, plus a translator
+   that turns the guest's Metal-derived GPU command stream into **software Vulkan
+   (Mesa lavapipe / llvmpipe)**. The guest's accelerated render submit (the
+   `CmdExecIndirect2` "op-0x37" stream) decodes to a fixed, small vocabulary of
+   **9 render opcodes** that map 1:1 onto core Vulkan; the translator walks that
+   inner Metal stream, recognizes the textured-quad composite signature, and
+   replays it through an embedded SPIR-V pipeline into a BGRA8 target — driven by
+   a timeline-semaphore completion path. This renders a **real macOS composite
+   frame on a non-Apple ARM/Linux host with no GPU at all** — proven end to end on
+   a non-Apple aarch64 Linux host running Mesa lavapipe (software Vulkan, no GPU).
+   Reproducible: build `anyos-qemu` + the translator, supply **your own** macOS
+   restore image, and run on a non-Apple ARM/Linux host with lavapipe. The method,
+   the op-0x37 two-layer model, the 9-opcode subset, the opcode→`vkCmd` mapping,
+   and the build/run steps are in
+   [`docs/metal-vulkan-translator.md`](docs/metal-vulkan-translator.md); the
+   original GPLv2 translator is [`gpu-translator/apple-gfx-vk.c`](gpu-translator/apple-gfx-vk.c).
 
 | Capability | Host | Status |
 |---|---|---|
@@ -54,7 +66,7 @@ machine:
 | Interactive shell over serial | Any | **Reached** |
 | Graphical kernel console (framebuffer / VNC) | Any | **Reached** |
 | Cross-platform build + boot | Linux / ARM | **Proven** (~50 s to bash) |
-| Framework-free PVG / Metal→Vulkan | non-Apple | In progress (modern `vmapple` track) |
+| Framework-free PVG + Metal→Vulkan: real composite frame, no GPU (lavapipe) | non-Apple ARM / Linux | **Rendered** (modern `vmapple` track; see `docs/metal-vulkan-translator.md`) |
 | Full Aqua / WindowServer desktop | — | Out of scope here |
 
 ## Layout
@@ -62,14 +74,19 @@ machine:
 ```
 STATUS.md                            What is reached / proven, with the landmark boot chain.
 docs/ROADMAP_crossplatform_gui.md    Phased Linux / Windows-ARM port + display tiers.
+docs/metal-vulkan-translator.md      The op-0x37 → Vulkan/lavapipe translator: model, 9-opcode subset, build/run.
 patches/tcg/                         The serial + W^X fixes (reference diff + rebuild recipe).
 patches/graphics/                    The xnu-ramfb kernel-console activation + VNC viewing.
+gpu-translator/                      The full modern-graphics source set (GPLv2): the framework-free
+                                     PVG device backend (apple-gfx-native.c/.h), the op-0x37 → software-
+                                     Vulkan translator (apple-gfx-vk.c), the interface seam (apple-gfx-vk.h),
+                                     and the embedded SPIR-V present shaders (pvg_vk_shaders.h).
 ```
 
 ## Reproducing
 
 See **`patches/tcg/README.md`**. In short: build QEMU 5.1.0 + the upstream
-macOS-on-QEMU fork, apply the W^X / serial patch, supply your own J273
+XNU-on-QEMU fork, apply the W^X / serial patch, supply your own J273
 kernelcache + device tree + ramdisk, and launch the `macos11-j273-a12z` machine
 with a serial console. On a Linux/ARM host the W^X machinery compiles out, so the
 ~2.8× penalty disappears and boot-to-shell lands in well under a minute.
@@ -79,6 +96,6 @@ with a serial console. On a Linux/ARM host the W^X machinery compiles out, so th
 GPLv2 — see [`LICENSE`](LICENSE). This is a **derivative of QEMU**
 (<https://www.qemu.org>) and is distributed under the same terms; no
 Apple-copyrighted material is included. It builds, as a reference, on the prior
-open-source macOS-on-QEMU lineage (Aleph Security `xnu-qemu-arm64`;
+open-source XNU-on-QEMU lineage (Aleph Security `xnu-qemu-arm64`;
 `zhuowei/qemu`; and the Cylance/BlackBerry J273 machine model + original
 boot-to-bash demonstration on Linux/TCG).

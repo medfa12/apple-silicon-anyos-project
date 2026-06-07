@@ -1,4 +1,4 @@
-# macOS-on-QEMU: Phased Roadmap to Cross-Platform Graphical macOS
+# XNU-on-QEMU: Phased Roadmap to Cross-Platform Graphical macOS
 
 > Cross-platform roadmap covering the Linux/Windows ARM port, graphical
 > display, and input + rootfs.
