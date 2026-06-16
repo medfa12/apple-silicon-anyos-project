@@ -55,9 +55,10 @@ machine:
    op-0x37 → Vulkan *pipeline* end to end, but the replay's source texture is the
    *captured* composite, so it is **not yet** live execution of the guest's own
    per-layer GPU work — no live, guest-rendered desktop frame has been
-   screendump-verified on a non-Apple host. Rendering the guest's live stream
-   (resolving its real surface backings + a real GPU-completion contract) is the
-   open frontier — see contribution 5 and `STATUS.md`.
+   screendump-verified on a non-Apple host. The two pieces that were the open
+   frontier here — **resolving the guest's real surface backings** and **a real
+   GPU-completion contract** — are now *implemented* (contribution 6); a live,
+   verified desktop frame on a non-Apple host remains the open goal.
    Reproducible: build `anyos-qemu` + the translator, supply **your own** macOS
    restore image, and run on a non-Apple ARM/Linux host with lavapipe. The method,
    the op-0x37 two-layer model, the 9-opcode subset, the opcode→`vkCmd` mapping,
@@ -79,6 +80,28 @@ machine:
    of contribution 4 — the GPU command stream now arrives; making it *complete*
    (live render + a real completion contract) is the remaining gap.
 
+6. **Real surface-backing resolution + a real GPU-completion contract** *(modern
+   `vmapple` track)* — the two pieces contribution 4 named as its open frontier,
+   now implemented. (a) The guest's per-layer UI source textures are **not** placed
+   on the GPU command FIFO; they are **objectID-indexed resources** installed
+   out-of-band (a GPU-virtual-address class and a host-shared-IOSurface class). That
+   wire model was reverse-engineered and an `objectID → backing` resolver
+   (`gt_resource`) implemented, so the translator can bind each composite layer's
+   real backing instead of a captured one. (b) A real **GPU-completion contract** is
+   implemented: an execution stamp signalled *after* the render actually completes,
+   and on present a display stamp + display interrupt — the edge a paravirtual-GPU
+   guest waits on to retire its command-timeout watchdog and wake its compositor —
+   marshalled onto the emulator's lock-holding thread for safety. In offline replay
+   the translator renders a 1920×1080 `task=1` composite frame with the resolver and
+   completion paths active. **Honesty:** this is verified at the host/translator
+   boundary only (the stamps / display interrupt / present are exercised offline) —
+   it is **not yet** a live, guest-rendered desktop on a non-Apple host. Deploying
+   this tree under KVM and confirming the live compositor-wake is the remaining step,
+   and one class of UI surfaces (host-shared IOSurfaces) is a known remaining sub-gap.
+   *The resolver + completion-contract source lives in the project's development
+   tree; the translator published in this repo is the op-0x37 → Vulkan pipeline
+   snapshot of contribution 4 and is updated in periodic source drops.*
+
 | Capability | Host | Status |
 |---|---|---|
 | Boot to userland `bash` (serial) | Linux / Windows / macOS ARM (x86 fallback) | **Reached** |
@@ -86,7 +109,8 @@ machine:
 | Graphical kernel console (framebuffer / VNC) | Any | **Reached** |
 | Cross-platform build + boot | Linux / ARM | **Proven** (~50 s to bash) |
 | Framework-free PVG + op-0x37 → Vulkan *pipeline* (lavapipe, no GPU) | non-Apple ARM / Linux | **Replay proven** (offline; captured-pixel source — see Honesty above) |
-| Modern set-up macOS → GPU-execution stage under KVM | non-Apple ARM | **Reached** (boot); live render = open |
+| objectID → real-backing resolver + GPU-completion contract | non-Apple ARM / Linux | **Implemented + host-side verified offline** (live, in-guest = open) |
+| Modern set-up macOS → GPU-execution stage under KVM | non-Apple ARM | **Reached** (boot); translator render gaps now closed (deploy = next) |
 | Live, guest-rendered composite / desktop frame on a non-Apple host | non-Apple ARM / Linux | **Open frontier** |
 | Full Aqua / WindowServer desktop | — | Out of scope here |
 

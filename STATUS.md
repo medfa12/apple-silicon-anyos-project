@@ -56,9 +56,18 @@ Two fronts:
    W^X penalty, working chaining, fast boot); the graphical kernel console
    (Tier 1) is reached. Display-tier analysis:
    [`docs/ROADMAP_crossplatform_gui.md`](docs/ROADMAP_crossplatform_gui.md).
-2. **Modern `vmapple` / KVM line** — the guest now reaches the paravirtual GPU,
-   but its command stream does not yet *complete*: the translator must execute
-   the real render (not just replay), resolve the guest's live surface backings,
-   and signal a real completion so XNU's GPU scheduler sees the frame finish.
-   That — a live, guest-rendered frame — is the honest remaining gap to a real
-   desktop on a non-Apple host.
+2. **Modern `vmapple` / KVM line** — the guest reaches the paravirtual GPU, and
+   the two pieces that blocked completion are now **implemented and host-side
+   verified offline**: (a) an `objectID → real-backing` resolver (the guest's
+   per-layer UI source textures are objectID-indexed *off* the GPU command FIFO;
+   that wire model was reverse-engineered and a resolver built so the translator
+   binds each layer's real backing), and (b) a real GPU-completion contract (an
+   execution stamp signalled after the render completes, plus a display stamp +
+   display interrupt on present — the edge the guest waits on to retire its
+   command-timeout watchdog and wake its compositor), marshalled onto the
+   emulator's lock-holding thread. The translator renders a 1920×1080 composite in
+   offline replay with these active. **The honest remaining gap** is deploying this
+   tree under KVM and confirming the *live* compositor-wake (the host-side edges are
+   verified; the in-guest wake is not), plus one class of UI surfaces (host-shared
+   IOSurfaces) still to resolve — i.e. a live, guest-rendered desktop frame on a
+   non-Apple host is still not screendump-verified.
