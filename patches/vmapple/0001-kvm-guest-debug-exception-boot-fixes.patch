@@ -1,0 +1,209 @@
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -903,6 +903,8 @@
+     static int impdef_nopped; /* count of 0xe7ffdeff NOPs applied so far */
+     static int mdscr_nopped;  /* count of MDSCR_EL1.KDE-set NOPs applied so far */
+     static int mlsie_nopped;  /* count of ml_set_interrupts_enabled_with_debug bl-panic NOPs */
++    static int mdscr_el0_nopped; /* count of update_mdscr orr-x1 NOPs (EL0 SS/MDE disarm) */
++    static int mlsie_daif_nopped; /* count of DAIF.D-clear assertion gate patches */
+     /*
+      * Overlap each chunk by enough to span the widest multi-word pattern we
+      * scan for. The original signatures span 24 bytes (sig_bytes); the
+@@ -910,7 +912,14 @@
+      * bl at +0x1c). Use the max so a pattern straddling a chunk edge is never
+      * split, and the buffer is large enough for the deepest read (no overread).
+      */
+-    const size_t overlap = (sig_bytes > 0x20) ? sig_bytes : 0x20;
++    /* [mlsie-daif] forward-validates a panic preamble up to ~600 words ahead
++     * of the `mrs x8,daif` anchor, so the per-chunk overlap must cover that
++     * forward reach (600*4 + 36 bytes) or an assertion gate straddling a chunk
++     * edge would never validate. 0x2000 (8 KiB) is comfortably larger. */
++    size_t overlap = (sig_bytes > 0x20) ? sig_bytes : 0x20;
++    if (overlap < 0x2000) {
++        overlap = 0x2000;
++    }
+     uint8_t *buf = g_malloc(chunk + overlap);
+ 
+     for (hwaddr off = 0; off < scan_len; off += chunk) {
+@@ -1106,6 +1115,171 @@
+                     (unsigned long long)pa, mlsie_nopped);
+                 fflush(stderr);
+             }
++
++            /*
++             * KVM/Tahoe (xnu-12377) EL0 (userland) DEBUG-EXCEPTION ROOT FIX
++             * (2026-06-16). Sibling of [mdscr-kde]/[mlsie-debug] above; this is
++             * the one that stops launchd-critical daemons (kernelmanagerd, ...)
++             * from being KILLED by a spurious EL0 SIGTRAP.
++             *
++             * SYMPTOM (live on the SET-UP disk under KVM): kernelmanagerd is
++             * respawned repeatedly (pid 121 -> 206 -> 209 ...); each instance has
++             * a thread that "triggered fail-safe by spinning for at least
++             * 1000000us at fixed priority" then "exited -- exit reason namespace 2
++             * subcode 0x5" (= SIGTRAP). The kernel also logs "triggered unnest of
++             * range ... of DYLD shared region ... While not abnormal for
++             * debuggers" -- the tell-tale of a single-step/monitor-debug storm at
++             * EL0. kernelmanagerd is launchd-critical, so its death panics the box.
++             *
++             * ROOT: the host (Neoverse-N3) ID_AA64DFR0_EL1.DoubleLock = 0xf is
++             * NOT spoofable by KVM, so XNU can never engage the OS debug lock; an
++             * EL0 debug-enable bit (MDSCR_EL1.SS single-step / .MDE monitor-debug)
++             * gets armed and the resulting debug exception is delivered to the
++             * daemon as EXC_BREAKPOINT -> SIGTRAP, in a self-perpetuating storm.
++             * [mdscr-kde] only stopped the EL1 KDE bit; EL0 SS/MDE are armed via a
++             * DIFFERENT path (the per-thread debug-state setter), so daemons still
++             * die.
++             *
++             * THE CHOKEPOINT: every MDSCR_EL1 modification in XNU routes through one
++             * read-modify-write helper update_mdscr(clear_x0, set_x1):
++             *     mov  x17, #0x0            ; d2800011
++             *     mrs  x16, mdscr_el1       ; d5300250
++             *     bic  x16, x16, x0         ; 8a200210   (clear caller's x0 bits)
++             *     orr  x16, x16, x1         ; aa010210   (SET caller's x1 bits) <== NOP
++             *     and  x16, x16, #~KDE      ; 9272fa10   (force-clear bit13 KDE)
++             *     msr  mdscr_el1, x16       ; d5100250
++             *     tst  x16, #0x2000         ; f273021f
++             * The per-thread debug-state setter (arm_debug_set_state) arms EL0
++             * single-step by calling update_mdscr(0, 0x1) (set SS=bit0); it also
++             * sets/clears MDE(bit15) the same way. By NOPing the `orr x16,x16,x1`
++             * the helper can no longer SET any MDSCR bit -> SS and MDE can NEVER be
++             * armed (the disarm calls via `bic` still work; the existing AND keeps
++             * KDE clear). EL0 debug exceptions are therefore never raised on ANY
++             * thread -> no daemon takes a spurious SIGTRAP. This is a ROOT fix (one
++             * chokepoint covers every daemon), not a per-daemon workaround.
++             *
++             * Anchored on the full 7-word slide-invariant window (all register-
++             * relative, no PC-relative operands) -> UNIQUE in the kernelcache
++             * (verified: exactly 1 occurrence in a live pmemsave of the loaded
++             * set-up-disk kernelcache, VA 0xfffffe0022cf51e4). The `orr` is at +0xc.
++             * KVM-only: under TCG/HVF apple-gxf engages the OS double lock so EL0
++             * debug is harmless and the guest must keep the live helper. Non-
++             * latching: once NOP'd the window no longer matches; multiple KC copies
++             * are each cleaned.
++             */
++            if (kvm_enabled() &&
++                ldl_le_p(buf + i)      == 0xd2800011u && /* mov x17,#0       */
++                ldl_le_p(buf + i + 4)  == 0xd5300250u && /* mrs x16,mdscr_el1*/
++                ldl_le_p(buf + i + 8)  == 0x8a200210u && /* bic x16,x16,x0   */
++                ldl_le_p(buf + i + 12) == 0xaa010210u && /* orr x16,x16,x1   */
++                ldl_le_p(buf + i + 16) == 0x9272fa10u && /* and x16,x16,#~KDE*/
++                ldl_le_p(buf + i + 20) == 0xd5100250u && /* msr mdscr_el1,x16*/
++                ldl_le_p(buf + i + 24) == 0xf273021fu) { /* tst x16,#0x2000  */
++                hwaddr pa = ram_base + off + i + 12; /* the orr x16,x16,x1 */
++                cpu_physical_memory_write(pa, &nop_word, 4);
++                total_sctlr++;
++                mdscr_el0_nopped++;
++                fprintf(stderr,
++                    "[mdscr-el0] NOP orr-x16,x1 (update_mdscr set-bits) -> "
++                    "EL0 MDSCR_EL1.SS/.MDE can never be armed; daemons no longer "
++                    "die on spurious EL0 SIGTRAP under KVM) at GPA 0x%llx [#%d]\n",
++                    (unsigned long long)pa, mdscr_el0_nopped);
++                fflush(stderr);
++            }
++
++            /*
++             * KVM/Tahoe (xnu-12377) "debug exceptions enabled in kernel mode"
++             * assertion — DISARM THE GATING BRANCH (2026-06-16). The TRUE halt.
++             *
++             * SYMPTOM: even with [mdscr-kde] (KDE off) + [mlsie-debug] (bl-panic
++             * NOPped) + [mdscr-el0] (SS/MDE never armed), the SET-UP disk still
++             * halts at ml_set_interrupts_enabled_with_debug, parked in `wfe;b .-4`.
++             * Live RE of the halt: the assertion is
++             *     mrs  x8, daif            ; d53b4228
++             *     tbz  w8, #9, <panic>     ; 0x36480008|imm  (D==0 -> PANIC)
++             *     ...real interrupt-enable work...
++             * i.e. it panics when DAIF.D (bit 9, the PSTATE *debug* mask) is CLEAR.
++             * Under KVM -cpu host on Neoverse-N3 the host does not maintain D the
++             * way XNU expects (the unspoofable ID_AA64DFR0_EL1.DoubleLock=0xf means
++             * XNU can never engage the OS debug lock), so D ends up clear at EL1 and
++             * the assertion fires. [mlsie-debug] only NOPped the FIRST of TWO panic
++             * calls in the inlined preamble; execution falls through to the SECOND
++             * panic (mov w0,#0x7020000; bl panic) and then loops -> the box hangs.
++             *
++             * Since [mdscr-kde]+[mdscr-el0] have already guaranteed NO debug-
++             * exception source is armed (KDE=0, MDE=0, SS=0), leaving DAIF.D clear
++             * at EL1 is HARMLESS -> the assertion is now spurious. ROOT FIX: make
++             * the gating branch NEVER take the panic, so the function runs its real
++             * interrupt-enable work. Two inlined idioms exist (both validated by the
++             * unique line-1254 panic preamble that follows: mov w8,#0x4e6 +
++             * add x9,#0xd5b "machine_routines_common.c" + add x10,#0xda8
++             * "ml_set_interrupts_..._debug" + add x0,#0xd75 "%s: debug exceptions
++             * enabled in kernel mode @%s:%d"):
++             *   (A) `mrs x8,daif ; tbz w8,#9,<FWD to preamble>`  -> NOP the tbz so
++             *       it falls through to the real work (the canonical/live form).
++             *   (B) `mrs x8,daif ; tbnz w8,#9,<BACK to continue>` with the preamble
++             *       as the FALL-THROUGH -> convert tbnz into an UNCONDITIONAL b to
++             *       the same continue label so the panic is always skipped.
++             * The anchor is `mrs x8,daif` (slide-invariant, reg-only) + the bit-9
++             * branch + a FORWARD-only validation that the branch gates a line-1254
++             * preamble -> it can only ever match this one assertion, never a benign
++             * daif read. KVM-only. Non-latching (NOP/`b` no longer match the idiom).
++             * Immediates pinned LIVE from a pmemsave of the loaded set-up-disk
++             * kernelcache (26.5/25F71): 277 reachable gates (265 idiom A + 12 idiom
++             * B), all validated against the panic preamble.
++             */
++            if (kvm_enabled() &&
++                i + 8 <= this_len &&
++                ldl_le_p(buf + i) == 0xd53b4228u) { /* mrs x8, daif */
++                uint32_t br = ldl_le_p(buf + i + 4);
++                bool is_tbz  = (br & 0xfff8001fu) == 0x36480008u; /* tbz  w8,#9,imm */
++                bool is_tbnz = (br & 0xfff8001fu) == 0x37480008u; /* tbnz w8,#9,imm */
++                if (is_tbz || is_tbnz) {
++                    int imm14 = (int)((br >> 5) & 0x3fffu);
++                    if (imm14 & 0x2000) {
++                        imm14 -= 0x4000; /* sign-extend */
++                    }
++                    /* preamble word-index relative to the branch (buf+i+4):
++                     *  idiom A: target = branch + imm14  (forward, <=600 words)
++                     *  idiom B: fall-through = branch + 1 word                  */
++                    long pre_w = is_tbz ? (long)imm14 : 1L;
++                    /* the mov w8,#0x4e6 preamble must be reachable & forward */
++                    size_t pre_off = i + 4 + (size_t)pre_w * 4;
++                    bool valid = false;
++                    if (is_tbz) {
++                        valid = (imm14 > 0 && imm14 <= 600 &&
++                                 pre_off + 36 <= this_len);
++                    } else { /* tbnz */
++                        valid = (pre_off + 36 <= this_len);
++                    }
++                    if (valid &&
++                        ldl_le_p(buf + pre_off)        == 0x52809cc8u && /* mov w8,#0x4e6 (line 1254) */
++                        ldl_le_p(buf + pre_off + 8)    == 0x91356d29u && /* add x9,x9,#0xd5b  */
++                        ldl_le_p(buf + pre_off + 16)   == 0x9136a14au && /* add x10,x10,#0xda8 */
++                        ldl_le_p(buf + pre_off + 32)   == 0x9135d400u) { /* add x0,x0,#0xd75  */
++                        hwaddr br_pa = ram_base + off + i + 4;
++                        uint32_t patch;
++                        const char *kind;
++                        if (is_tbz) {
++                            patch = nop_word; /* never branch to panic; fall through to work */
++                            kind = "tbz->NOP";
++                        } else {
++                            /* tbnz w8,#9,X -> b X (always take the continue path) */
++                            uint32_t imm26 = ((uint32_t)imm14) & 0x03ffffffu;
++                            patch = 0x14000000u | imm26;
++                            kind = "tbnz->b";
++                        }
++                        cpu_physical_memory_write(br_pa, &patch, 4);
++                        total_sctlr++;
++                        mlsie_daif_nopped++;
++                        fprintf(stderr,
++                            "[mlsie-daif] %s (DAIF.D-clear kernel-mode debug "
++                            "assertion gate) at GPA 0x%llx [#%d]\n",
++                            kind, (unsigned long long)br_pa, mlsie_daif_nopped);
++                        fflush(stderr);
++                    }
++                }
++            }
+         }
+     }
+     g_free(buf);
+@@ -1261,7 +1435,8 @@
+          */
+         bool kvm_early_pending = kvm_enabled() &&
+                                  (impdef_nopped < 2 || mdscr_nopped < 1 ||
+-                                  mlsie_nopped < 1);
++                                  mlsie_nopped < 1 || mdscr_el0_nopped < 1 ||
++                                  mlsie_daif_nopped < 1);
+         int next_ms = kvm_early_pending ? 8 : 400;
+         timer_mod(vmapple_apfs_timer,
+                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + next_ms);

@@ -2,7 +2,7 @@
 
 Original QEMU work toward running Apple's **XNU / macOS cross-platform** — on a
 Linux or Windows ARM host, not only Apple hardware — through the
-software-emulation (TCG) path.
+software-emulation (TCG) path, and, for the modern `vmapple` machine, under KVM.
 
 > **No Apple software is distributed here.** This repository contains only
 > original analysis and original modifications to open-source QEMU. To reproduce
@@ -41,7 +41,7 @@ machine:
    viewable over VNC. A graphical kernel *console*, not an Aqua desktop.
 
 4. **Framework-free Apple paravirtual-graphics + a Metal→Vulkan translator that
-   renders a real composite frame on a GPU-less non-Apple host** *(modern
+   replays a captured composite frame on a GPU-less non-Apple host** *(modern
    `vmapple` track)*. A from-scratch reimplementation of the Apple PVG device that
    runs **without** Apple's `ParavirtualizedGraphics.framework`, plus a translator
    that turns the guest's Metal-derived GPU command stream into **software Vulkan
@@ -50,9 +50,14 @@ machine:
    **9 render opcodes** that map 1:1 onto core Vulkan; the translator walks that
    inner Metal stream, recognizes the textured-quad composite signature, and
    replays it through an embedded SPIR-V pipeline into a BGRA8 target — driven by
-   a timeline-semaphore completion path. This renders a **real macOS composite
-   frame on a non-Apple ARM/Linux host with no GPU at all** — proven end to end on
-   a non-Apple aarch64 Linux host running Mesa lavapipe (software Vulkan, no GPU).
+   a timeline-semaphore completion path — on a non-Apple aarch64 Linux host with
+   Mesa lavapipe (software Vulkan, no GPU). **Honesty:** this proves the full
+   op-0x37 → Vulkan *pipeline* end to end, but the replay's source texture is the
+   *captured* composite, so it is **not yet** live execution of the guest's own
+   per-layer GPU work — no live, guest-rendered desktop frame has been
+   screendump-verified on a non-Apple host. Rendering the guest's live stream
+   (resolving its real surface backings + a real GPU-completion contract) is the
+   open frontier — see contribution 5 and `STATUS.md`.
    Reproducible: build `anyos-qemu` + the translator, supply **your own** macOS
    restore image, and run on a non-Apple ARM/Linux host with lavapipe. The method,
    the op-0x37 two-layer model, the 9-opcode subset, the opcode→`vkCmd` mapping,
@@ -60,13 +65,29 @@ machine:
    [`docs/metal-vulkan-translator.md`](docs/metal-vulkan-translator.md); the
    original GPLv2 translator is [`gpu-translator/apple-gfx-vk.c`](gpu-translator/apple-gfx-vk.c).
 
+5. **A modern set-up macOS boots under KVM to the GPU-execution stage on a
+   non-Apple ARM host** *(modern `vmapple` track, `patches/vmapple/`)*. Distinct
+   from the Big Sur / TCG boot above, an already-set-up macOS 26 reaches full
+   userland — Bluetooth, networking, audio, a complete APFS root, and the
+   paravirtual-GPU stack submitting real GPU command streams — under **KVM** on a
+   non-Apple ARM host. The blocker was a host debug-feature gap
+   (`ID_AA64DFR0_EL1.DoubleLock` is unspoofable under KVM, so XNU can never mask
+   the debug exceptions it expects to lock out → a kernel-assertion + EL0-`SIGTRAP`
+   cascade that panics the guest), cleared by KVM-gated, runtime-anchored
+   guest-kernel debug-exception disarms (no Apple bytes shipped; anchors pinned
+   from the live kernel). This puts the modern guest **at** the graphics frontier
+   of contribution 4 — the GPU command stream now arrives; making it *complete*
+   (live render + a real completion contract) is the remaining gap.
+
 | Capability | Host | Status |
 |---|---|---|
 | Boot to userland `bash` (serial) | Linux / Windows / macOS ARM (x86 fallback) | **Reached** |
 | Interactive shell over serial | Any | **Reached** |
 | Graphical kernel console (framebuffer / VNC) | Any | **Reached** |
 | Cross-platform build + boot | Linux / ARM | **Proven** (~50 s to bash) |
-| Framework-free PVG + Metal→Vulkan: real composite frame, no GPU (lavapipe) | non-Apple ARM / Linux | **Rendered** (modern `vmapple` track; see `docs/metal-vulkan-translator.md`) |
+| Framework-free PVG + op-0x37 → Vulkan *pipeline* (lavapipe, no GPU) | non-Apple ARM / Linux | **Replay proven** (offline; captured-pixel source — see Honesty above) |
+| Modern set-up macOS → GPU-execution stage under KVM | non-Apple ARM | **Reached** (boot); live render = open |
+| Live, guest-rendered composite / desktop frame on a non-Apple host | non-Apple ARM / Linux | **Open frontier** |
 | Full Aqua / WindowServer desktop | — | Out of scope here |
 
 ## Layout
@@ -77,6 +98,7 @@ docs/ROADMAP_crossplatform_gui.md    Phased Linux / Windows-ARM port + display t
 docs/metal-vulkan-translator.md      The op-0x37 → Vulkan/lavapipe translator: model, 9-opcode subset, build/run.
 patches/tcg/                         The serial + W^X fixes (reference diff + rebuild recipe).
 patches/graphics/                    The xnu-ramfb kernel-console activation + VNC viewing.
+patches/vmapple/                     KVM guest-kernel debug-exception boot fixes (modern macOS → GPU stage).
 gpu-translator/                      The full modern-graphics source set (GPLv2): the framework-free
                                      PVG device backend (apple-gfx-native.c/.h), the op-0x37 → software-
                                      Vulkan translator (apple-gfx-vk.c), the interface seam (apple-gfx-vk.h),
