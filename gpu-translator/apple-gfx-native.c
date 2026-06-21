@@ -1219,24 +1219,56 @@ static bool pg_native_resolve_pages(PGNativeDevice *d, PGSurface *s,
         uint32_t off = (uint32_t)strtoul(e, NULL, 0);
         pte_src_gpa = desc_gpa + off;
     } else {
-        /* Auto-discover. (a) inline trailer, only if it fits the 0x200 slot. */
-        if (PVG_SDESC_PTE_INLINE_DEFAULT + (uint64_t)page_count * 4 <= 0x200 &&
+        /* (0) PRIMARY (live-confirmed on Tahoe 26.5, set-up disk): the descriptor's
+         * WORD0 (hdr+0x00) is itself a PTE — PFN<<2 | present(0x1) — pointing at a
+         * SEPARATE page that holds the surface's page-list ARRAY (one PFN<<2|present
+         * per 16 KiB pixel page; `page_count` entries then zero). The page-list array
+         * is NOT inline in the 0x200 geometry descriptor; it is one indirection away
+         * via word0. Decoded: a word0 of 0x001d8909 -> (>>2)<<14 = 0x1d8908000 = a
+         * clean 507-entry PFN table (alloc 0x7e9000 = 1920*1080*4). An earlier scan
+         * missed this because word0 has the present bit set (cand & 0x3 != 0) and its
+         * PFN<<2 form was never tried. This is the real wire encoding
+         * (the on-wire mapper packs PFN=GPA>>14 | present into u32 PTEs). */
+        {
+            uint32_t w0 = rd_u32(hdr + 0x00);
+            if (w0 & PVG_IOSFC_PTE_PRESENT) {
+                uint64_t pl_gpa = (uint64_t)(w0 >> 2) << PVG_GUEST_PAGE_SHIFT;
+                if (pl_gpa >= 0x10000 &&
+                    pg_native_pte_array_ok(d, pl_gpa, page_count)) {
+                    pte_src_gpa = pl_gpa;
+                    pg_log(d, "resolve_pages: PTE array @0x%llx via desc-word0 "
+                              "(PFN<<2|present=0x%x, %u pages)",
+                           (unsigned long long)pl_gpa, w0, page_count);
+                }
+            }
+        }
+        /* (a) inline trailer, only if it fits the 0x200 slot. */
+        if (!pte_src_gpa &&
+            PVG_SDESC_PTE_INLINE_DEFAULT + (uint64_t)page_count * 4 <= 0x200 &&
             pg_native_pte_array_ok(d, desc_gpa + PVG_SDESC_PTE_INLINE_DEFAULT,
                                    page_count)) {
             pte_src_gpa = desc_gpa + PVG_SDESC_PTE_INLINE_DEFAULT;
         }
         /* (b) indirect: scan the descriptor for a u32/u64 that, read as a raw
-         * GPA or as a PFN (<<14), points at a coherent PTE array. */
+         * GPA, a PFN (<<14), or a PFN<<2|present PTE, points at a coherent PTE
+         * array. The PTE form ((v>>2)<<14, present bit set) is the on-wire mapper
+         * encoding (same as word0 above) — try it for any word with the present
+         * bit set, so a page-list root stored at a non-zero descriptor offset is
+         * still found. */
         for (uint32_t off = 0; !pte_src_gpa && off + 4 <= 0x200; off += 4) {
             uint64_t v32 = rd_u32(hdr + off);
-            uint64_t cands[4];
+            uint64_t cands[5];
+            const char *enc[5];
             int nc = 0;
-            cands[nc++] = v32;                                  /* u32 GPA   */
-            cands[nc++] = v32 << PVG_GUEST_PAGE_SHIFT;          /* u32 PFN   */
+            cands[nc] = v32;                            enc[nc] = "GPA";      nc++;
+            cands[nc] = v32 << PVG_GUEST_PAGE_SHIFT;    enc[nc] = "PFN<<14";  nc++;
+            if (v32 & PVG_IOSFC_PTE_PRESENT) {          /* PFN<<2|present PTE */
+                cands[nc] = (uint64_t)(v32 >> 2) << PVG_GUEST_PAGE_SHIFT;
+                enc[nc] = "PFN<<2|P"; nc++;
+            }
             if ((off & 7) == 0 && off + 8 <= 0x200) {
                 uint64_t v64 = rd_u64(hdr + off);
-                cands[nc++] = v64;                              /* u64 GPA   */
-                cands[nc++] = v64 << PVG_GUEST_PAGE_SHIFT;      /* u64 PFN   */
+                cands[nc] = v64;                        enc[nc] = "u64GPA";   nc++;
             }
             for (int k = 0; k < nc; k++) {
                 uint64_t cand = cands[k];
@@ -1246,8 +1278,7 @@ static bool pg_native_resolve_pages(PGNativeDevice *d, PGSurface *s,
                 if (pg_native_pte_array_ok(d, cand, page_count)) {
                     pte_src_gpa = cand;
                     pg_log(d, "resolve_pages: PTE array @0x%llx via desc+0x%x "
-                              "(enc=%s)", (unsigned long long)cand, off,
-                           k & 1 ? "PFN<<14" : "GPA");
+                              "(enc=%s)", (unsigned long long)cand, off, enc[k]);
                     break;
                 }
             }

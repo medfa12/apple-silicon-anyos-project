@@ -74,3 +74,75 @@ Build `anyos-qemu` with this patch, supply **your own** set-up macOS restore
 image, and launch the `vmapple` machine under KVM (`-accel kvm -cpu host`) on a
 non-Apple ARM host. The patcher's settle bound is exposed as an environment
 knob. GPLv2, as a derivative of QEMU.
+
+---
+
+# `0002-aes-completion-irq-boot-to-userland.patch`
+
+A second, independent boot blocker, this time in the emulated **AES device**
+(`hw/vmapple/aes.c`) rather than the CPU debug path. It is a pure QEMU
+device-model bug fix and is independent of the accelerator (it bites under TCG
+as well as KVM).
+
+> **No Apple software is distributed here.** This patch modifies only the
+> open-source QEMU device model and embeds no Apple code.
+
+## The problem — a swallowed completion interrupt
+
+The vmapple AES block has a small command **FIFO** processed *synchronously*:
+each 32-bit word written to the FIFO register is appended and the command is
+run immediately. A batched command sequence ends with a **`CMD_FLAG`
+terminator**, and it is that terminator's handler which raises the device's
+**command-complete interrupt** (status bit 5). The in-guest macOS AES driver
+arms that interrupt and puts its command gate to **sleep** waiting for it; if
+the completion interrupt never arrives, the gate sleeps forever and the guest
+kernel **wedges before reaching userland**.
+
+Two device-model bugs conspired to swallow that completion interrupt on the
+driver's *builtin-key* path (a `CMD_KEY` selecting one of the device's builtin
+keys by index, followed by a `CMD_DATA`, followed by the `CMD_FLAG`
+terminator):
+
+1. **Unpopulated builtin-key slots.** `builtin_keys[]` carried a valid key
+   length for only a few of its indices. When the driver selected an
+   unpopulated index, that slot's key length was `0`, so the data command found
+   no matching AES algorithm and **failed**.
+
+2. **"Drain only on success."** `fifo_process()` cleared the FIFO only when a
+   command succeeded, so the *failed* `CMD_DATA` stayed buffered. The next word
+   written — the `CMD_FLAG` terminator — was then appended to and **misparsed
+   as more payload** of the stuck command, so the terminator handler never ran,
+   the completion bit was never set, and the driver slept forever. (The
+   barrier commands `CMD_DSB` / `CMD_SKG` hit the same trap: the old default
+   path marked them *invalid* and never drained them either.)
+
+## The fix — make every command sequence complete
+
+All three changes are ordinary device-model corrections:
+
+- **Populate every builtin-key slot** with a valid AES-256 key length, so
+  selecting any index yields a usable cipher and the sequence runs to its
+  terminator.
+- **Drain the FIFO on payload-complete, not only on success.** A new
+  `cmd_payload_elems()` helper reports how many payload words each recognised
+  command expects; once those words are present the FIFO is drained even if the
+  op itself failed, so a failed command can never swallow the trailing
+  `CMD_FLAG` terminator. Only a *genuinely incomplete* command (still buffering
+  payload) is left in the FIFO.
+- **Treat `CMD_DSB` / `CMD_SKG` as drained no-op barriers** instead of invalid
+  commands — they queue and wait on nothing and belong to the same terminated
+  batch.
+
+## Result
+
+With the AES command sequence completing, the completion interrupt fires, the
+driver's command gate wakes, and the guest **boots through to a full userland**
+(WindowServer plus the usual daemon set). This is the prerequisite that lets
+the GPU/compositor work in `0001` and the translator docs become reachable at
+all.
+
+## Reproducing
+
+Build `anyos-qemu` with this patch applied to `hw/vmapple/aes.c` and boot your
+own set-up macOS image on the `vmapple` machine (TCG or KVM). GPLv2, as a
+derivative of QEMU.

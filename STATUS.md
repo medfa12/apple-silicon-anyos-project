@@ -22,33 +22,53 @@
   chaining enabled (≈4× faster than the macOS host, matching the original
   Linux/TCG figure). Interactive shell confirmed there too. See
   `docs/ROADMAP_crossplatform_gui.md` Phase B and the build/run scripts.
-- **Modern set-up macOS boots under KVM to the GPU-execution stage (non-Apple
-  ARM).** Distinct from the Big Sur / TCG line above: an already-set-up modern
-  macOS (the `vmapple` machine class, macOS 26) boots under **KVM** on a
-  non-Apple ARM host through full userland — Bluetooth, networking, audio, a
-  complete APFS root, and the paravirtual-GPU stack — to where its compositor
-  submits real GPU command streams. The blocker was a host debug-feature gap
-  (`ID_AA64DFR0_EL1.DoubleLock` is unspoofable under KVM, so XNU can never mask
-  the debug exceptions it expects to lock out → a kernel-assertion + EL0-`SIGTRAP`
-  cascade), cleared by KVM-gated, runtime-anchored guest-kernel debug-exception
-  disarms. No Apple binaries shipped; anchors are pinned from the live kernel.
-  See `patches/vmapple/`.
+- **Modern set-up macOS boots to FULL USERLAND under KVM (non-Apple ARM).**
+  Distinct from the Big Sur / TCG line above: an already-set-up modern macOS (the
+  `vmapple` machine class, macOS 26 / Tahoe-class) boots under **KVM** on a
+  non-Apple ARM host all the way to a complete userland — WindowServer plus on
+  the order of **120 system daemons** (Bluetooth, networking, audio, a full APFS
+  root). Two host gates cleared this:
+  1. *Debug-feature gap.* `ID_AA64DFR0_EL1.DoubleLock` is unspoofable under KVM,
+     so XNU can never mask the debug exceptions it expects to lock out → a
+     kernel-assertion + EL0-`SIGTRAP` cascade. Cleared by KVM-gated,
+     runtime-anchored guest-kernel debug-exception disarms (no Apple bytes
+     shipped; anchors pinned from the live kernel). See `patches/vmapple/`.
+  2. *AES-completion wedge.* The emulated AES engine never delivered the
+     completion interrupt the keystore driver sleeps on during early boot, so the
+     guest wedged before userland. Root-caused to a builtin-key length gap in the
+     device model and fixed by validating every builtin key slot and draining the
+     command FIFO on payload-complete. See `docs/breakthrough-boot-and-first-pixels.md`.
+- **WindowServer composites continuously on the non-Apple host.** With a
+  *set-up* (already-activated, autologin) macOS disk booted **without** the
+  throwaway `-snapshot` overlay — so the first-boot finalize persists — the
+  guest's compositor reaches **continuous compositing**: tens of thousands of
+  `op-0x37` accelerated render submits over a run (a fresh, never-activated disk
+  instead parks forever in Setup-Assistant activation and never submits a single
+  one). See `docs/breakthrough-boot-and-first-pixels.md`.
+- **The real macOS wallpaper renders on the non-Apple host (first real pixels).**
+  The framework-free PVG device's surface-page resolver was extended to follow the
+  geometry descriptor's word-0 page-list indirection; with that, the guest's
+  scanout IOSurfaces resolve from `pages = 0` to their real page lists (e.g. 507
+  pages for a 1920×1080 BGRA8 surface) and the VNC output shows the **real macOS
+  desktop wallpaper** plus a band of composited UI — produced on a non-Apple ARM
+  host with no GPU. See `docs/breakthrough-boot-and-first-pixels.md`.
 
 ## Known limitations
 - On a macOS host, runtime TB chaining is broken under Apple W^X (pre-existing),
   so runs require `-d nochain`. A Linux host avoids this entirely (the W^X layer
   is Apple-guarded and compiles out).
-- This is the J273 / XNU-7195 baseline kernel. Porting forward to a current
-  XNU is a separate, larger effort.
-- **The Metal→Vulkan translator's rendered frame is, today, an offline *replay*.**
-  It faithfully decodes a captured `op-0x37` command stream and replays it through
-  real software-Vulkan (lavapipe) into a BGRA8 target — but the replay's source
-  texture is the *captured* composite, so it demonstrates the pipeline mechanics,
-  not live execution of the guest's own per-layer GPU work. Executing the live
-  stream — resolving the guest's real surface backings and honouring the GPU
-  command-completion contract — is the open frontier (now reached on the modern
-  KVM track above), **not** a finished result. No live, guest-rendered desktop
-  frame has been screendump-verified on a non-Apple host yet.
+- This is the J273 / XNU-7195 baseline kernel for the TCG line. Porting that line
+  forward to a current XNU is a separate, larger effort.
+- **The composited UI is not yet fully on screen.** The host translator now
+  renders the guest's `op-0x37` composite into its own Vulkan image, and the
+  scanout IOSurface's real page list resolves, so the wallpaper and a band of UI
+  appear — but the translator does **not yet write its rendered composite back
+  into the resolved scanout IOSurface**, so the full per-layer UI is not yet
+  routed to the scanout. This is the single remaining gap on the modern line: a
+  VK-composite → scanout write-back. The desktop is **partial**, not finished.
+- One class of UI source surfaces (host-shared IOSurfaces, as opposed to the
+  GPU-virtual-address class) is a known remaining sub-case for the per-layer
+  resolver.
 
 ## Next
 Two fronts:
@@ -56,18 +76,13 @@ Two fronts:
    W^X penalty, working chaining, fast boot); the graphical kernel console
    (Tier 1) is reached. Display-tier analysis:
    [`docs/ROADMAP_crossplatform_gui.md`](docs/ROADMAP_crossplatform_gui.md).
-2. **Modern `vmapple` / KVM line** — the guest reaches the paravirtual GPU, and
-   the two pieces that blocked completion are now **implemented and host-side
-   verified offline**: (a) an `objectID → real-backing` resolver (the guest's
-   per-layer UI source textures are objectID-indexed *off* the GPU command FIFO;
-   that wire model was reverse-engineered and a resolver built so the translator
-   binds each layer's real backing), and (b) a real GPU-completion contract (an
-   execution stamp signalled after the render completes, plus a display stamp +
-   display interrupt on present — the edge the guest waits on to retire its
-   command-timeout watchdog and wake its compositor), marshalled onto the
-   emulator's lock-holding thread. The translator renders a 1920×1080 composite in
-   offline replay with these active. **The honest remaining gap** is deploying this
-   tree under KVM and confirming the *live* compositor-wake (the host-side edges are
-   verified; the in-guest wake is not), plus one class of UI surfaces (host-shared
-   IOSurfaces) still to resolve — i.e. a live, guest-rendered desktop frame on a
-   non-Apple host is still not screendump-verified.
+2. **Modern `vmapple` / KVM line** — the guest now boots to full userland,
+   WindowServer composites continuously, and the **real macOS wallpaper renders
+   on the non-Apple host** (`docs/breakthrough-boot-and-first-pixels.md`). The
+   single remaining step to a full guest-rendered desktop is the
+   **VK-composite → scanout write-back**: the translator already renders the
+   `op-0x37` composite into a Vulkan image and the scanout IOSurface's page list
+   already resolves, so the work is copying the rendered composite into the
+   resolved scanout surface (and resolving the remaining host-shared-IOSurface
+   source class). Until that lands, the on-screen result is honestly **partial** —
+   wallpaper + a UI band, not the full composited desktop.

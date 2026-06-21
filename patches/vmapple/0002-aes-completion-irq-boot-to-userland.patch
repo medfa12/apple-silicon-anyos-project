@@ -1,0 +1,145 @@
+diff --git a/hw/vmapple/aes.c b/hw/vmapple/aes.c
+index e082c04..0a37a61 100644
+--- a/hw/vmapple/aes.c
++++ b/hw/vmapple/aes.c
+@@ -98,7 +98,30 @@ typedef struct IV {
+     uint32_t iv[4];
+ } IV;
+ 
++/*
++ * A CMD_KEY can either carry an inline key payload or select one of the
++ * device's *builtin* keys by index, after which a CMD_DATA AES-wraps a small
++ * blob with the selected key. The macOS driver's key-derivation path issues a
++ * CMD_KEY that selects a builtin slot, then a CMD_DATA, then a CMD_FLAG
++ * terminator that is what actually raises the command-complete IRQ.
++ *
++ * Only a few builtin slots used to carry a non-zero key_len. If the driver
++ * selects a slot whose key_len is 0, cmd_data() rejects the op at the
++ * key-length switch (no matching AES algorithm) and returns failure. Combined
++ * with the old "drain only on success" rule that left the failed command in
++ * the FIFO (see fifo_process()), the trailing CMD_FLAG terminator was then
++ * misparsed as further payload of the stuck command, so cmd_flag() never ran,
++ * REG_IRQ_STATUS bit5 (the completion flag) was never raised, and the driver's
++ * command-gate sleep blocked forever -> the guest wedged before userland.
++ *
++ * Give every builtin slot a valid AES-256 key_len so any selected index
++ * produces a usable cipher and the command sequence completes normally.
++ */
+ static Key builtin_keys[CMD_KEY_SELECT_MAX_IDX + 1] = {
++    [0] = {
++        .key_len = 32,
++        .key = { 0x0 },
++    },
+     [1] = {
+         .key_len = 32,
+         .key = { 0x1 },
+@@ -110,7 +133,23 @@ static Key builtin_keys[CMD_KEY_SELECT_MAX_IDX + 1] = {
+     [3] = {
+         .key_len = 32,
+         .key = { 0x3 },
+-    }
++    },
++    [4] = {
++        .key_len = 32,
++        .key = { 0x4 },
++    },
++    [5] = {
++        .key_len = 32,
++        .key = { 0x5 },
++    },
++    [6] = {
++        .key_len = 32,
++        .key = { 0x6 },
++    },
++    [7] = {
++        .key_len = 32,
++        .key = { 0x7 },
++    },
+ };
+ 
+ struct AESState {
+@@ -410,10 +449,47 @@ static bool cmd_flag(AESState *s)
+     return true;
+ }
+ 
++/*
++ * How many *payload* words (in addition to fifo[0]) a recognised command needs
++ * before it can be processed. Used to distinguish "still buffering payload"
++ * (keep the FIFO) from "payload complete" (drain, even if the op failed) so a
++ * failed op can never swallow the trailing CMD_FLAG terminator. A software-key
++ * CMD_KEY carries key_len/4 inline words; a builtin-key CMD_KEY and the barrier
++ * commands carry none.
++ */
++static uint32_t cmd_payload_elems(AESState *s)
++{
++    uint32_t cmd = s->fifo[0] >> CMD_SHIFT;
++    uint32_t key_select = (s->fifo[0] & CMD_KEY_SELECT_MASK) >> CMD_KEY_SELECT_SHIFT;
++    uint32_t key_len;
++
++    switch (cmd) {
++    case CMD_KEY:
++        if (key_select) {
++            return 0;          /* builtin key: no inline payload */
++        }
++        key_len = key_lens[(s->fifo[0] & CMD_KEY_KEY_LEN_MASK) >> CMD_KEY_KEY_LEN_SHIFT];
++        return key_len / sizeof(uint32_t);
++    case CMD_IV:
++        return 4;
++    case CMD_DATA:
++        return 3;
++    case CMD_STORE_IV:
++        return 1;
++    case CMD_FLAG:
++    case CMD_DSB:
++    case CMD_SKG:
++        return 0;
++    default:
++        return 0;
++    }
++}
++
+ static void fifo_process(AESState *s)
+ {
+     uint32_t cmd = s->fifo[0] >> CMD_SHIFT;
+     bool success = false;
++    bool drain;
+ 
+     if (!s->fifo_idx) {
+         return;
+@@ -435,12 +511,35 @@ static void fifo_process(AESState *s)
+     case CMD_FLAG:
+         success = cmd_flag(s);
+         break;
++    case CMD_DSB:
++    case CMD_SKG:
++        /*
++         * Data-sync barrier / key-generation barrier: these queue and wait on
++         * nothing, so just consume them. They are part of the same batched
++         * command sequence that ends in a CMD_FLAG terminator; treating them as
++         * INVALID (the old default path) left them undrained and let the
++         * terminator be misparsed, so the completion IRQ never fired.
++         */
++        success = true;
++        break;
+     default:
+         s->irq_status |= REG_IRQ_STATUS_INVALID_CMD;
+         break;
+     }
+ 
+-    if (success) {
++    /*
++     * Drain the FIFO when the command completed (success) OR when its payload
++     * is fully present but the op failed (e.g. a DMA/crypto error in cmd_data).
++     * In the latter case the hardware would still consume the words and surface
++     * the error via the per-command result; what it must NOT do is leave the
++     * partial command in the FIFO, because then the guest-written CMD_FLAG
++     * terminator would be misparsed as more payload and cmd_flag() would never
++     * run -> REG_IRQ_STATUS bit5 (the completion IRQ) would never fire and the
++     * driver's command-gate sleep would block forever. Only a genuinely
++     * incomplete command (still waiting for payload words) is left buffered.
++     */
++    drain = success || has_payload(s, cmd_payload_elems(s));
++    if (drain) {
+         s->fifo_idx = 0;
+     }
+ 
